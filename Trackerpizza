@@ -1,0 +1,279 @@
+blueprint:
+  name: Tracker pizza (ALL-IN-ONE) v2
+  description: >
+    Tracciamento Consegne Completo: Calcolo Tempi Viaggio/Sosta, Notifiche Waze, 
+    Report Giornaliero e Settimanale.
+  domain: automation
+  input:
+    # --- SENSORI BASE ---
+    vehicle_tracker:
+      name: Veicolo (device_tracker)
+      description: Il sensore di tracciamento del veicolo (es. device_tracker.panda).
+      selector:
+        entity:
+          domain: device_tracker
+    geocoded_location_sensor:
+      name: Sensore Indirizzo (Geocoded)
+      description: Il sensore per la posizione geocodificata (l'indirizzo).
+      selector:
+        entity:
+          domain: sensor
+    waze_travel_time_sensor:
+      name: Sensore Waze (Traffico)
+      description: Il sensore Waze configurato per il rientro in pizzeria.
+      selector:
+        entity:
+          domain: sensor
+
+    # --- ZONE ---
+    pizzeria_zone:
+      name: Zona Pizzeria
+      selector:
+        entity:
+          domain: zone
+
+    # --- AIUTANTI (Helper) NECESSARI ---
+    start_time_helper:
+      name: Helper Orario Partenza (input_datetime)
+      selector:
+        entity:
+          domain: input_datetime
+    arrival_time_helper:
+      name: Helper Orario Arrivo (input_datetime)
+      selector:
+        entity:
+          domain: input_datetime
+    delivery_in_progress_helper:
+      name: Helper Stato Consegna (input_boolean)
+      selector:
+        entity:
+          domain: input_boolean
+    daily_delivery_counter:
+      name: Contatore Consegne Giornaliero
+      selector:
+        entity:
+          domain: counter
+    weekly_delivery_counter:
+      name: Contatore Consegne Settimanale
+      selector:
+        entity:
+          domain: counter
+
+    # --- SERVIZI E TARGET ---
+    telegram_target_id:
+      name: Chat ID Telegram
+      description: Il tuo ID Chat (341280357).
+      default: 341280357
+      selector:
+        text:
+    alexa_announcement_target:
+      name: Target Alexa (Entità Notify)
+      description: Seleziona l'entità 'notify' (es. notify.echo_show_di_giorgia_annuncio).
+      selector:
+        entity:
+          domain: notify
+          multiple: true
+    mobile_app_target:
+      name: Servizio Mobile App (per GPS)
+      description: Il servizio di notifica del telefono Panda (es. notify.mobile_app_panda).
+      selector:
+        text:
+
+    # --- ORARI TURNO ---
+    shift_start_time:
+      name: Orario Inizio Turno
+      default: "18:00:00"
+      selector:
+        time:
+    shift_end_time:
+      name: Orario Fine Turno
+      default: "23:30:00"
+      selector:
+        time:
+    weekly_report_time:
+      name: Orario Report Settimanale (Domenica)
+      default: "23:35:00"
+      selector:
+        time:
+
+mode: queued
+max_exceeded: silent
+
+trigger:
+  - entity_id: !input vehicle_tracker
+    zone: !input pizzeria_zone
+    event: leave
+    id: partenza_pizzeria
+    platform: zone
+  - entity_id: !input vehicle_tracker
+    attribute: speed
+    below: 2
+    for: "00:00:40"
+    id: stop_rilevato
+    platform: numeric_state
+  - entity_id: !input vehicle_tracker
+    attribute: speed
+    above: 5
+    id: ripartenza_rilevata
+    platform: numeric_state
+  - entity_id: !input vehicle_tracker
+    zone: !input pizzeria_zone
+    event: enter
+    id: rientro_sede
+    platform: zone
+  - at: !input shift_start_time
+    id: inizio_turno
+    platform: time
+  - at: !input shift_end_time
+    id: fine_turno
+    platform: time
+  - at: !input weekly_report_time
+    id: report_settimanale
+    platform: time
+
+condition: []
+
+action:
+  - choose:
+      # AZIONE 1: Partenza dalla Pizzeria
+      - conditions:
+          - condition: trigger
+            id: partenza_pizzeria
+        sequence:
+          - target:
+              entity_id: !input start_time_helper
+            data:
+              time: "{{ now().strftime('%H:%M:%S') }}"
+            service: input_datetime.set_datetime
+
+      # AZIONE 2: Stop Rilevato (Registrazione orario arrivo)
+      - conditions:
+          - condition: trigger
+            id: stop_rilevato
+          - condition: not
+            conditions:
+              - condition: state
+                entity_id: !input vehicle_tracker
+                state: !input pizzeria_zone
+          - condition: template
+            value_template: "{{ distance(states[inputs.vehicle_tracker].entity_id, states[inputs.pizzeria_zone].entity_id) > 0.1 }}"
+        sequence:
+          - target:
+              entity_id: !input arrival_time_helper
+            data:
+              time: "{{ now().strftime('%H:%M:%S') }}"
+            service: input_datetime.set_datetime
+          - target:
+              entity_id: !input delivery_in_progress_helper
+            service: input_boolean.turn_on
+
+      # AZIONE 3: Ripartenza (Invio notifiche e calcoli)
+      - conditions:
+          - condition: trigger
+            id: ripartenza_rilevata
+          - condition: state
+            entity_id: !input delivery_in_progress_helper
+            state: "on"
+        sequence:
+          - target:
+              entity_id: !input daily_delivery_counter
+            service: counter.increment
+          - target:
+              entity_id: !input weekly_delivery_counter
+            service: counter.increment
+          # Notifica Telegram
+          - service: telegram_bot.send_message
+            data:
+              target: !input telegram_target_id
+              message: >
+                ✅ Consegna effettuata!
+
+                📊 N. {{ states(inputs.daily_delivery_counter) }} di oggi
+
+                🚚 Viaggio: **{{ ((as_timestamp(states(inputs.arrival_time_helper) | today_at) -
+                as_timestamp(states(inputs.start_time_helper) | today_at)) / 60) | int }} min** (calcolato all'arrivo)
+
+                ⏱️ Sosta: {{ (as_timestamp(now()) -
+                as_timestamp(states(inputs.arrival_time_helper) | today_at)) | int }} sec
+                
+                📍 {{ states(inputs.geocoded_location_sensor) }}
+          - delay: "00:00:02"
+          # Notifica Alexa (con Waze)
+          - service: notify.send_message
+            target:
+              entity_id: !input alexa_announcement_target
+            data:
+              message: >-
+                Consegna effettuata in {{
+                states(inputs.geocoded_location_sensor).split(',')[0] }}.
+                Traffico per il rientro: {{ states(inputs.waze_travel_time_sensor) |
+                int }} minuti.
+          # Reset dello stato consegna
+          - target:
+              entity_id: !input delivery_in_progress_helper
+            service: input_boolean.turn_off
+
+      # AZIONE 4: Rientro in Sede
+      - conditions:
+          - condition: trigger
+            id: rientro_sede
+        sequence:
+          - target:
+              entity_id: !input alexa_announcement_target
+            data:
+              message: "Attenzione: La Panda è rientrata in pizzeria."
+            service: notify.send_message
+
+      # AZIONE 5: Inizio Turno (Reset e GPS preciso)
+      - conditions:
+          - condition: trigger
+            id: inizio_turno
+        sequence:
+          - service: counter.reset
+            target:
+              entity_id: !input daily_delivery_counter
+          - service: !input mobile_app_target
+            data:
+              message: command_high_accuracy_mode
+              title: turn_on
+
+      # AZIONE 6: Fine Turno (Report e Risparmio batteria)
+      - conditions:
+          - condition: trigger
+            id: fine_turno
+        sequence:
+          - service: telegram_bot.send_message
+            data:
+              target: !input telegram_target_id
+              message: >
+                🌙 **Fine Turno!** Totale oggi: **{{
+                states(inputs.daily_delivery_counter) }}**
+          - service: !input mobile_app_target
+            data:
+              message: command_high_accuracy_mode
+              title: "turn_off"
+          - service: counter.reset
+            target:
+              entity_id: !input daily_delivery_counter
+
+      # AZIONE 7: Report Settimanale (Solo Domenica)
+      - conditions:
+          - condition: trigger
+            id: report_settimanale
+          - condition: time
+            weekday:
+              - sun
+        sequence:
+          - service: telegram_bot.send_message
+            data:
+              target: !input telegram_target_id
+              message: >
+                📅 **REPORT SETTIMANALE**
+
+                Totale consegne settimana: **{{
+                states(inputs.weekly_delivery_counter) }}**
+
+                Buon riposo!
+          - service: counter.reset
+            target:
+              entity_id: !input weekly_delivery_counter
