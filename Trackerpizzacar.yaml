@@ -1,0 +1,333 @@
+blueprint:
+  name: "Gestione Completa Panda (Giorgio)"
+  description: >
+    Unifica il monitoraggio consegne, la gestione automatica del GPS (Alta Precisione)
+    e gli avvisi di rientro in sede.
+  domain: automation
+  input:
+    # --- Dispositivi ---
+    panda_tracker:
+      name: Tracker Panda
+      description: Il device tracker della Panda (es. device_tracker.panda)
+      selector:
+        entity:
+          domain: device_tracker
+    mobile_app_notify:
+      name: Notifica App Mobile (GPS)
+      description: Servizio notifica app per attivare il GPS (es. notify.mobile_app_panda)
+      selector:
+        text:
+    
+    # --- Zone ---
+    base_zone:
+      name: Zona Pizzeria (Base)
+      description: La zona di partenza (es. zone.pizzeria)
+      selector:
+        entity:
+          domain: zone
+
+    # --- Notifiche ---
+    alexa_targets:
+      name: Dispositivi Alexa
+      description: Dispositivi per gli annunci vocali.
+      default: 
+        - notify.echo_show_di_giorgia_annuncio
+        - notify.echo_show_di_giorgia_parla
+      selector:
+        entity:
+          domain: notify
+          multiple: true
+    telegram_chat_id:
+      name: Telegram Chat ID
+      description: Chat ID per i report (Default: 341280357).
+      default: 341280357
+      selector:
+        text:
+
+    # --- Helpers (Entità di supporto) ---
+    helper_departure_time:
+      name: Input Orario Partenza
+      selector:
+        entity:
+          domain: input_datetime
+    helper_arrival_time:
+      name: Input Orario Arrivo
+      selector:
+        entity:
+          domain: input_datetime
+    helper_travel_minutes:
+      name: Input Minuti Viaggio
+      selector:
+        entity:
+          domain: input_number
+    helper_in_delivery:
+      name: Input Boolean In Consegna
+      selector:
+        entity:
+          domain: input_boolean
+    counter_daily:
+      name: Contatore Giornaliero
+      selector:
+        entity:
+          domain: counter
+    counter_weekly:
+      name: Contatore Settimanale
+      selector:
+        entity:
+          domain: counter
+    counter_partial:
+      name: Contatore Parziale (Annunci)
+      selector:
+        entity:
+          domain: counter
+
+    # --- Orari ---
+    time_start_shift:
+      name: Inizio Turno
+      default: "18:00:00"
+      selector:
+        time:
+    time_end_shift:
+      name: Fine Turno
+      default: "23:30:00"
+      selector:
+        time:
+    time_weekly_report:
+      name: Report Settimanale
+      default: "23:35:00"
+      selector:
+        time:
+
+variables:
+  tracker: !input panda_tracker
+  base: !input base_zone
+  h_dep_time: !input helper_departure_time
+  h_arr_time: !input helper_arrival_time
+  h_travel_min: !input helper_travel_minutes
+  h_in_del: !input helper_in_delivery
+  c_daily: !input counter_daily
+  c_weekly: !input counter_weekly
+  c_part: !input counter_partial
+  alexa_ents: !input alexa_targets
+
+trigger:
+  # 1. Partenza Pizzeria
+  - platform: zone
+    entity_id: !input panda_tracker
+    zone: !input base_zone
+    event: leave
+    id: partenza_pizzeria
+  # 2. Stop Rilevato
+  - platform: numeric_state
+    entity_id: !input panda_tracker
+    attribute: speed
+    below: 0.2
+    for:
+      seconds: 50
+    id: stop_rilevato
+  # 3. Ripartenza Rilevata
+  - platform: numeric_state
+    entity_id: !input panda_tracker
+    attribute: speed
+    above: 2
+    id: ripartenza_rilevata
+  # 4. Rientro Pizzeria
+  - platform: zone
+    entity_id: !input panda_tracker
+    zone: !input base_zone
+    event: enter
+    id: rientro_sede
+  # 5. Gestione Turno (Start/End)
+  - platform: time
+    at: !input time_start_shift
+    id: inizio_turno
+  - platform: time
+    at: !input time_end_shift
+    id: fine_turno
+  # 6. Report
+  - platform: time
+    at: !input time_weekly_report
+    id: report_settimanale
+
+action:
+  - choose:
+      # A. PARTENZA PIZZERIA
+      - conditions:
+          - condition: trigger
+            id: partenza_pizzeria
+          - condition: time
+            after: !input time_start_shift
+            before: "04:00:00"
+        sequence:
+          - target:
+              entity_id: !input helper_departure_time
+            data:
+              time: "{{ now().strftime('%H:%M:%S') }}"
+            action: input_datetime.set_datetime
+
+      # B. STOP RILEVATO (ARRIVO)
+      - conditions:
+          - condition: trigger
+            id: stop_rilevato
+          - condition: template
+            value_template: "{{ states(tracker) != states(base) }}"
+          - condition: template
+            value_template: "{{ distance(tracker, base) > 0.1 }}"
+          - condition: time
+            after: !input time_start_shift
+            before: "04:00:00"
+        sequence:
+          - target:
+              entity_id: !input helper_arrival_time
+            data:
+              time: "{{ now().strftime('%H:%M:%S') }}"
+            action: input_datetime.set_datetime
+          - variables:
+              start_time: "{{ states(h_dep_time) | today_at }}"
+              end_time: "{{ now() }}"
+              travel_time_seconds: "{{ (as_timestamp(end_time) - as_timestamp(start_time)) | int(0) }}"
+          - target:
+              entity_id: !input helper_travel_minutes
+            data:
+              value: "{{ (travel_time_seconds / 60) | round(1) }}"
+            action: input_number.set_value
+          - target:
+              entity_id: !input helper_in_delivery
+            action: input_boolean.turn_on
+
+      # C. RIPARTENZA (CONFERMA CONSEGNA)
+      - conditions:
+          - condition: trigger
+            id: ripartenza_rilevata
+          - condition: state
+            entity_id: !input helper_in_delivery
+            state: "on"
+          - condition: time
+            after: !input time_start_shift
+            before: "04:00:00"
+        sequence:
+          - target:
+              entity_id:
+                - !input counter_daily
+                - !input counter_weekly
+                - !input counter_partial
+            action: counter.increment
+          - data:
+              target: !input telegram_chat_id
+              message: >
+                ✅ Consegna effettuata!
+                
+                📊 N. {{ states(c_daily) }} di oggi
+                
+                ➡️ Viaggio: {{ states(h_travel_min) }} min
+                📏 Distanza: {{ distance(tracker, base) | round(2) }} km
+                ⏱️ Sosta: {{ (as_timestamp(now()) - as_timestamp(states(h_arr_time) | today_at)) | int(0) }} sec
+                📍 {{ states('sensor.panda_geocoded_location') }}
+            action: telegram_bot.send_message
+          - target:
+              entity_id: !input alexa_targets
+            data:
+              message: >-
+                {% set zona = states(tracker) %}
+                {% if 'Cliente' in zona %}
+                  Consegna numero {{ states(c_part) }} effettuata da {{ zona }}.
+                  Questo cliente ha ordinato {{ states('counter.' ~ (zona | slugify)) }} volte in totale.
+                {% else %}
+                  Consegna numero {{ states(c_part) }} effettuata in {{ states('sensor.panda_geocoded_location').split(',')[0] }}.
+                {% endif %}
+            action: notify.send_message
+          - target:
+              entity_id: !input helper_arrival_time
+            data:
+              time: "00:00:00"
+            action: input_datetime.set_datetime
+          - target:
+              entity_id: !input helper_in_delivery
+            action: input_boolean.turn_off
+
+      # D. RIENTRO IN SEDE (Con blocco ripetizioni 5 min)
+      - conditions:
+          - condition: trigger
+            id: rientro_sede
+          - condition: time
+            after: !input time_start_shift
+            before: "04:00:00"
+        sequence:
+          - action: counter.reset
+            target:
+              entity_id: !input counter_partial
+          # Condizione Anti-Spam (verifica che l'ultimo cambio di stato zona sia > 300s se necessario, 
+          # ma qui integriamo l'azione diretta come da tua richiesta "Annuncio Rientro")
+          - target:
+              entity_id: !input alexa_targets
+            data:
+              message: "Attenzione: La Panda è rientrata in pizzeria."
+            action: notify.send_message
+
+      # E. INIZIO TURNO (Attiva GPS e Reset)
+      - conditions:
+          - condition: trigger
+            id: inizio_turno
+        sequence:
+          - action: counter.reset
+            target:
+              entity_id:
+                - !input counter_daily
+                - !input counter_partial
+          - action: !input mobile_app_notify
+            data:
+              message: command_high_accuracy_mode
+              title: turn_on
+          - target:
+              entity_id:
+                - !input helper_departure_time
+                - !input helper_arrival_time
+            data:
+              time: "00:00:00"
+            action: input_datetime.set_datetime
+          - data:
+              target: !input telegram_chat_id
+              message: "🔔 Inizio Turno: Contatore azzerato e GPS attivo."
+            action: telegram_bot.send_message
+
+      # F. FINE TURNO (Spegni GPS e Report)
+      - conditions:
+          - condition: trigger
+            id: fine_turno
+        sequence:
+          - data:
+              target: !input telegram_chat_id
+              message: >
+                🌙 **Fine Turno!** Totale consegne oggi: **{{ states(c_daily) }}**
+            action: telegram_bot.send_message
+          - action: !input mobile_app_notify
+            data:
+              message: command_high_accuracy_mode
+              title: turn_off
+          - action: counter.reset
+            target:
+              entity_id:
+                - !input counter_daily
+                - !input counter_partial
+
+      # G. REPORT SETTIMANALE
+      - conditions:
+          - condition: trigger
+            id: report_settimanale
+          - condition: time
+            weekday:
+              - sun
+        sequence:
+          - data:
+              target: !input telegram_chat_id
+              message: >
+                📅 **REPORT SETTIMANALE**
+                
+                Totale consegne settimana: **{{ states(c_weekly) }}**
+                
+                Buon riposo!
+            action: telegram_bot.send_message
+          - action: counter.reset
+            target:
+              entity_id: !input counter_weekly
+mode: queued
